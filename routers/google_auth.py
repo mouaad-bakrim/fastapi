@@ -28,38 +28,50 @@ async def auth_google(request: Request):
     # استخدام الرابط المعرف في .env
     return await oauth.google.authorize_redirect(request, os.getenv('GOOGLE_REDIRECT_URI'))
 
+from fastapi import HTTPException
+from datetime import datetime, timedelta
+import secrets
+from utils.magic_link import create_magic_token, send_magic_link
 @router.get("/auth/google/callback")
-async def google_callback(request: Request, settings: Annotated[Settings, Depends(get_settings)]):
+async def google_callback(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)]
+):
+    token = await oauth.google.authorize_access_token(request)
+    user_info = token.get("userinfo") or {}
+
+    email = user_info.get("email")
+    full_name = user_info.get("name")
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Google email not found")
+
+    conn = connect_to_db()
+    cursor = get_db_cursor(conn)
     try:
-        token = await oauth.google.authorize_access_token(request)
-        user_info = token.get("userinfo") or {}
-        email = user_info.get("email")
-        full_name = user_info.get("name")
+        cursor.execute(
+            """
+            INSERT INTO users (username, email, full_name)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (email) DO UPDATE SET full_name=EXCLUDED.full_name
+            """,
+            (email, email, full_name),
+        )
+        conn.commit()
 
-        # حفظ أو تحديث المستخدم في PostgreSQL
-        conn = connect_to_db()
-        cursor = get_db_cursor(conn)
-        cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
-        user = cursor.fetchone()
+        # ✅ هنا الحل
+        raw_token, token_hash = create_magic_token()
+        expires_at = datetime.utcnow() + timedelta(minutes=15)
 
-        if not user:
-            cursor.execute(
-                "INSERT INTO users (username, email, full_name) VALUES (%s, %s, %s)",
-                (email, email, full_name)
-            )
-            conn.commit()
-        
+        cursor.execute(
+            "INSERT INTO login_links (email, token_hash, expires_at) VALUES (%s, %s, %s)",
+            (email, token_hash, expires_at),
+        )
+        conn.commit()
+
+        send_magic_link(settings, email, raw_token)
+
+        return {"message": "✅ Magic link envoyé par email."}
+    finally:
         cursor.close()
         conn.close()
-
-        # إنشاء JWT توكن
-        access_token = create_access_token(
-            settings, 
-            data={"sub": email}, 
-            expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
-            auth_method="google"
-        )
-
-        return {"access_token": access_token, "token_type": "bearer", "user": user_info}
-    except Exception as e:
-        return {"error": str(e)}

@@ -167,3 +167,59 @@ async def reset_password(payload: ResetPasswordRequest):
     finally:
         cursor.close()
         conn.close()
+
+
+from pydantic import BaseModel
+from datetime import datetime, timedelta
+from utils.magic_link import hash_token
+
+class ConsumeMagicLink(BaseModel):
+    token: str
+
+@router.post("/magic/consume", response_model=Token)
+def consume_magic_link(
+    payload: ConsumeMagicLink,
+    settings: Annotated[Settings, Depends(get_settings)]
+):
+    token_hash = hash_token(payload.token)
+
+    conn = connect_to_db()
+    cursor = conn.cursor()  # ولا get_db_cursor إذا بغيتي dict
+    try:
+        cursor.execute(
+            """
+            SELECT id, email, expires_at, used_at
+            FROM login_links
+            WHERE token_hash=%s
+            """,
+            (token_hash,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=400, detail="Invalid link")
+
+        link_id, email, expires_at, used_at = row
+
+        if used_at is not None:
+            raise HTTPException(status_code=400, detail="Link already used")
+
+        # expires_at جاية كـ datetime من postgres
+        if expires_at < datetime.utcnow():
+            raise HTTPException(status_code=400, detail="Link expired")
+
+        # mark used
+        cursor.execute("UPDATE login_links SET used_at=NOW() WHERE id=%s", (link_id,))
+        conn.commit()
+
+        # create JWT
+        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            settings, data={"sub": email}, expires_delta=access_token_expires
+        )
+        return {"access_token": access_token, "token_type": "bearer"}
+    except:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()

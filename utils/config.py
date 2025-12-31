@@ -16,6 +16,16 @@ class Settings(BaseSettings):
     # AJOUTEZ CETTE LIGNE
     DATABASE_URL: str
 
+    # SMTP
+    SMTP_HOST: str
+    SMTP_PORT: int
+    SMTP_USERNAME: str
+    SMTP_PASSWORD: str
+    SMTP_FROM: str
+
+    FRONTEND_URL: str
+
+
     model_config = SettingsConfigDict(
         env_file=".env", 
         extra="ignore"  # CECI RÉSOUT L'ERREUR "Extra inputs are not permitted"

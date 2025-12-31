@@ -2,8 +2,8 @@ from typing import Annotated
 from utils.schema import  User
 from fastapi import Depends,APIRouter
 from utils.db_helper import connect_to_db
+from .auth import get_current_user
 
-from .auth import get_current_active_user
 
 router = APIRouter()
 
@@ -12,7 +12,7 @@ router = APIRouter()
 # Returns a list containing a sample item with the user's username
 @router.get("/users/me/")
 async def read_own_items(
-    current_user: Annotated[User, Depends(get_current_active_user)]
+    current_user: Annotated[User, Depends(get_current_user)]
 ):
     conn = connect_to_db()
     cursor = conn.cursor()
@@ -46,7 +46,7 @@ async def read_own_items():
 
 @router.get("/users/auth")
 async def read_own_items(
-    current_user_data: Annotated[dict, Depends(get_current_active_user)]
+    current_user_data: Annotated[dict, Depends(get_current_user)]
 ):
     user = current_user_data["user"]
     auth_method = current_user_data["auth_method"]
