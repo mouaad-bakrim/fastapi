@@ -8,12 +8,13 @@ from functools import lru_cache
 from fastapi import Depends, HTTPException, status, APIRouter
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from jwt.exceptions import InvalidTokenError
 
 from utils.schema import Token
 from utils.config import Settings
-from utils.db_helper import connect_to_db
+from utils.db_helper import connect_to_db, get_db_cursor
+from utils.magic_link import hash_token
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -23,7 +24,7 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 def get_settings():
     return Settings()
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
 # --- Schemas ---
@@ -35,17 +36,34 @@ class ResetPasswordRequest(BaseModel):
     email: EmailStr
     new_password: str
 
-# --- Utils ---
+    # ✅ bcrypt limit: 72 bytes
+    @field_validator("new_password")
+    @classmethod
+    def password_max_len(cls, v: str):
+        if len(v.encode("utf-8")) > 72:
+            raise ValueError("Mot de passe trop long (max 72 bytes avec bcrypt).")
+        return v
 
+class ConsumeMagicLink(BaseModel):
+    token: str
+
+# --- Utils ---
 def verify_password(plain_password: str, hashed_password: str) -> bool:
+    # ✅ bcrypt limit guard (72 bytes)
+    if len(plain_password.encode("utf-8")) > 72:
+        return False
     return pwd_context.verify(plain_password, hashed_password)
 
+
 def get_password_hash(password: str) -> str:
+    # ✅ extra guard
+    if len(password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="Mot de passe trop long (max 72 bytes).")
     return pwd_context.hash(password)
 
 def get_user(email: str):
     conn = connect_to_db()
-    cursor = conn.cursor(dictionary=True)
+    cursor = get_db_cursor(conn)  # ✅ Postgres dict rows
     try:
         cursor.execute("SELECT * FROM users WHERE email = %s;", (email,))
         return cursor.fetchone()
@@ -56,6 +74,8 @@ def get_user(email: str):
 def authenticate_user(email: str, password: str):
     user = get_user(email)
     if not user:
+        return False
+    if not user.get("hashed_password"):
         return False
     if not verify_password(password, user["hashed_password"]):
         return False
@@ -69,11 +89,13 @@ def create_access_token(settings: Settings, data: dict, expires_delta: Optional[
 
 def send_reset_email(email_to: str, settings: Settings):
     msg = EmailMessage()
-    reset_link = f"http://localhost:3000/reset-password?email={email_to}"
+    reset_link = f"{settings.FRONTEND_URL}/reset-password?email={email_to}"
 
     msg.set_content(
-        f"Bonjour,\n\nCliquez sur ce lien pour modifier votre mot de passe :\n{reset_link}\n\n"
-        f"Si vous n'avez pas demandé cela, ignorez cet e-mail."
+        "Bonjour,\n\n"
+        "Cliquez sur ce lien pour modifier votre mot de passe :\n"
+        f"{reset_link}\n\n"
+        "Si vous n'avez pas demandé cela, ignorez cet e-mail."
     )
     msg["Subject"] = "Réinitialisation de votre mot de passe"
     msg["From"] = settings.GOOGLE_EMAIL
@@ -140,10 +162,8 @@ async def forgot_password(
 ):
     # ✅ Bonne pratique: ne pas révéler si l'email existe
     user = get_user(payload.email)
-
     if user:
         send_reset_email(payload.email, settings)
-
     return {"message": "Si votre e-mail existe, une notification a été envoyée !"}
 
 @router.post("/reset-password")
@@ -158,8 +178,6 @@ async def reset_password(payload: ResetPasswordRequest):
             (hashed_pwd, payload.email),
         )
         conn.commit()
-
-        # même logique: pas de leak d'existence
         return {"message": "Si votre compte existe, le mot de passe a été mis à jour."}
     except Exception:
         conn.rollback()
@@ -167,14 +185,6 @@ async def reset_password(payload: ResetPasswordRequest):
     finally:
         cursor.close()
         conn.close()
-
-
-from pydantic import BaseModel
-from datetime import datetime, timedelta
-from utils.magic_link import hash_token
-
-class ConsumeMagicLink(BaseModel):
-    token: str
 
 @router.post("/magic/consume", response_model=Token)
 def consume_magic_link(
@@ -184,7 +194,7 @@ def consume_magic_link(
     token_hash = hash_token(payload.token)
 
     conn = connect_to_db()
-    cursor = conn.cursor()  # ولا get_db_cursor إذا بغيتي dict
+    cursor = get_db_cursor(conn)  # ✅ dict rows
     try:
         cursor.execute(
             """
@@ -195,23 +205,21 @@ def consume_magic_link(
             (token_hash,),
         )
         row = cursor.fetchone()
+
         if not row:
             raise HTTPException(status_code=400, detail="Invalid link")
 
-        link_id, email, expires_at, used_at = row
-
-        if used_at is not None:
+        if row["used_at"] is not None:
             raise HTTPException(status_code=400, detail="Link already used")
 
-        # expires_at جاية كـ datetime من postgres
-        if expires_at < datetime.utcnow():
+        if row["expires_at"] < datetime.utcnow():
             raise HTTPException(status_code=400, detail="Link expired")
 
-        # mark used
-        cursor.execute("UPDATE login_links SET used_at=NOW() WHERE id=%s", (link_id,))
+        cursor.execute("UPDATE login_links SET used_at=NOW() WHERE id=%s", (row["id"],))
         conn.commit()
 
-        # create JWT
+        email = row["email"]
+
         access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
             settings, data={"sub": email}, expires_delta=access_token_expires
