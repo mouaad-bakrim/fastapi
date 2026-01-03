@@ -8,7 +8,7 @@ from functools import lru_cache
 from fastapi import Depends, HTTPException, status, APIRouter
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, EmailStr
 from jwt.exceptions import InvalidTokenError
 
 from utils.schema import Token
@@ -18,58 +18,63 @@ from utils.magic_link import hash_token
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
-# --- Configuration ---
 
+# -------------------------
+# Settings
+# -------------------------
 @lru_cache
 def get_settings():
     return Settings()
 
+
+# ✅ أنت خدام بـ argon2، إذن ماكاناش limit 72 bytes ديال bcrypt
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
-# --- Schemas ---
 
+# -------------------------
+# Schemas
+# -------------------------
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
+
 
 class ResetPasswordRequest(BaseModel):
     email: EmailStr
     new_password: str
 
-    # ✅ bcrypt limit: 72 bytes
-    @field_validator("new_password")
-    @classmethod
-    def password_max_len(cls, v: str):
-        if len(v.encode("utf-8")) > 72:
-            raise ValueError("Mot de passe trop long (max 72 bytes avec bcrypt).")
-        return v
 
 class ConsumeMagicLink(BaseModel):
     token: str
 
-# --- Utils ---
+
+# -------------------------
+# Utils
+# -------------------------
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    # ✅ bcrypt limit guard (72 bytes)
-    if len(plain_password.encode("utf-8")) > 72:
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception:
         return False
-    return pwd_context.verify(plain_password, hashed_password)
 
 
 def get_password_hash(password: str) -> str:
-    # ✅ extra guard
-    if len(password.encode("utf-8")) > 72:
-        raise HTTPException(status_code=400, detail="Mot de passe trop long (max 72 bytes).")
-    return pwd_context.hash(password)
+    try:
+        return pwd_context.hash(password)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Mot de passe invalide")
+
 
 def get_user(email: str):
     conn = connect_to_db()
-    cursor = get_db_cursor(conn)  # ✅ Postgres dict rows
+    cur = get_db_cursor(conn)  # ✅ Postgres dict rows
     try:
-        cursor.execute("SELECT * FROM users WHERE email = %s;", (email,))
-        return cursor.fetchone()
+        cur.execute("SELECT * FROM users WHERE email = %s;", (email,))
+        return cur.fetchone()
     finally:
-        cursor.close()
+        cur.close()
         conn.close()
+
 
 def authenticate_user(email: str, password: str):
     user = get_user(email)
@@ -81,11 +86,13 @@ def authenticate_user(email: str, password: str):
         return False
     return user
 
+
 def create_access_token(settings: Settings, data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
 
 def send_reset_email(email_to: str, settings: Settings):
     msg = EmailMessage()
@@ -110,11 +117,13 @@ def send_reset_email(email_to: str, settings: Settings):
         print(f"Erreur SMTP : {e}")
         return False
 
-# --- Dependencies ---
 
+# -------------------------
+# Dependency: current user
+# -------------------------
 async def get_current_user(
     settings: Annotated[Settings, Depends(get_settings)],
-    token: Annotated[str, Depends(oauth2_scheme)]
+    token: Annotated[str, Depends(oauth2_scheme)],
 ):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -127,19 +136,23 @@ async def get_current_user(
         email: str | None = payload.get("sub")
         if not email:
             raise credentials_exception
+
         user = get_user(email)
         if not user:
             raise credentials_exception
+
         return user
     except InvalidTokenError:
         raise credentials_exception
 
-# --- Routes ---
 
+# -------------------------
+# Routes
+# -------------------------
 @router.post("/token", response_model=Token)
 async def login(
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
-    settings: Annotated[Settings, Depends(get_settings)]
+    settings: Annotated[Settings, Depends(get_settings)],
 ):
     user = authenticate_user(form_data.username, form_data.password)
     if not user:
@@ -149,31 +162,45 @@ async def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # ✅ منع login إذا الحساب pending (اختياري ولكن مفيد)
+    if user.get("status") == "PENDING":
+        raise HTTPException(status_code=403, detail="Compte en attente de validation")
+
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        settings, data={"sub": user["email"]}, expires_delta=access_token_expires
+        settings,
+        data={"sub": user["email"]},
+        expires_delta=access_token_expires,
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+
+    # ✅ نرجعو role/status باش front يقرر مباشرة admin/user
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "role": user.get("role"),
+        "status": user.get("status"),
+    }
+
 
 @router.post("/forgot-password")
 async def forgot_password(
     payload: ForgotPasswordRequest,
-    settings: Annotated[Settings, Depends(get_settings)]
+    settings: Annotated[Settings, Depends(get_settings)],
 ):
-    # ✅ Bonne pratique: ne pas révéler si l'email existe
     user = get_user(payload.email)
     if user:
         send_reset_email(payload.email, settings)
     return {"message": "Si votre e-mail existe, une notification a été envoyée !"}
+
 
 @router.post("/reset-password")
 async def reset_password(payload: ResetPasswordRequest):
     hashed_pwd = get_password_hash(payload.new_password)
 
     conn = connect_to_db()
-    cursor = conn.cursor()
+    cur = get_db_cursor(conn)
     try:
-        cursor.execute(
+        cur.execute(
             "UPDATE users SET hashed_password = %s WHERE email = %s",
             (hashed_pwd, payload.email),
         )
@@ -183,51 +210,62 @@ async def reset_password(payload: ResetPasswordRequest):
         conn.rollback()
         raise HTTPException(status_code=500, detail="Erreur lors de la mise à jour en base de données")
     finally:
-        cursor.close()
+        cur.close()
         conn.close()
+
 
 @router.post("/magic/consume", response_model=Token)
 def consume_magic_link(
     payload: ConsumeMagicLink,
-    settings: Annotated[Settings, Depends(get_settings)]
+    settings: Annotated[Settings, Depends(get_settings)],
 ):
-    token_hash = hash_token(payload.token)
+    token_h = hash_token(payload.token)
 
     conn = connect_to_db()
-    cursor = get_db_cursor(conn)  # ✅ dict rows
+    cur = get_db_cursor(conn)
     try:
-        cursor.execute(
+        cur.execute(
             """
             SELECT id, email, expires_at, used_at
             FROM login_links
             WHERE token_hash=%s
             """,
-            (token_hash,),
+            (token_h,),
         )
-        row = cursor.fetchone()
-
+        row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=400, detail="Invalid link")
 
         if row["used_at"] is not None:
             raise HTTPException(status_code=400, detail="Link already used")
 
+        # ✅ expires_at من Postgres غالباً naive UTC -> نقارن بـ utcnow() naive
         if row["expires_at"] < datetime.utcnow():
             raise HTTPException(status_code=400, detail="Link expired")
 
-        cursor.execute("UPDATE login_links SET used_at=NOW() WHERE id=%s", (row["id"],))
+        cur.execute("UPDATE login_links SET used_at=NOW() WHERE id=%s", (row["id"],))
         conn.commit()
 
         email = row["email"]
+        user = get_user(email)
+        if not user:
+            raise HTTPException(status_code=400, detail="User not found")
+
+        # ✅ إذا مازال pending ما نخليهوش يدخل
+        if user.get("status") == "PENDING":
+            raise HTTPException(status_code=403, detail="Compte en attente de validation")
 
         access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
-            settings, data={"sub": email}, expires_delta=access_token_expires
+            settings,
+            data={"sub": email},
+            expires_delta=access_token_expires,
         )
+
         return {"access_token": access_token, "token_type": "bearer"}
-    except:
+    except Exception:
         conn.rollback()
         raise
     finally:
-        cursor.close()
+        cur.close()
         conn.close()

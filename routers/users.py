@@ -1,57 +1,40 @@
-from typing import Annotated
-from utils.schema import  User
-from fastapi import Depends,APIRouter
-from utils.db_helper import connect_to_db
-from .auth import get_current_user
+# routers/users.py
+
+from fastapi import APIRouter, Depends
+from routers.auth import get_current_user
+from utils.db_helper import connect_to_db, get_db_cursor
+
+router = APIRouter(tags=["Users"])
 
 
-router = APIRouter()
-
-
-# Endpoint to get items belonging to current authenticated user
-# Returns a list containing a sample item with the user's username
+# =========================================================
+# ✅ USER CONNECTÉ (me)
+# =========================================================
 @router.get("/users/me/")
-async def read_own_items(
-    current_user: Annotated[User, Depends(get_current_user)]
-):
+async def read_me(current_user=Depends(get_current_user)):
+    """
+    Return ONLY the authenticated user from JWT
+    """
+    return {"user": current_user}
+
+
+# =========================================================
+# ✅ LIST USERS (PUBLIC - POUR TEST SEULEMENT)
+# ⚠️ À supprimer ou protéger en prod
+# =========================================================
+@router.get("/users/public")
+def list_users_public():
     conn = connect_to_db()
-    cursor = conn.cursor()
-
-    query = "SELECT * FROM users;"
-    cursor.execute(query)
-    users = cursor.fetchall()
-
-    cursor.close()
-    conn.close()
-    
-    return {"users": users}
-
-
-
-
-@router.get("/users/me/public")
-async def read_own_items():
-    conn = connect_to_db()
-    cursor = conn.cursor(dictionary=True)
-
-    query = "SELECT * FROM users;"
-    cursor.execute(query)
-    users = cursor.fetchall()
-
-    cursor.close()
-    conn.close()
-    
-    return {"users": users}
-
-
-@router.get("/users/auth")
-async def read_own_items(
-    current_user_data: Annotated[dict, Depends(get_current_user)]
-):
-    user = current_user_data["user"]
-    auth_method = current_user_data["auth_method"]
-
-    return {
-        "message": f"Authenticated via {auth_method}",
-        "user": user
-    }
+    cur = get_db_cursor(conn)
+    try:
+        cur.execute(
+            """
+            SELECT id, email, full_name, status, role
+            FROM users
+            ORDER BY id DESC
+            """
+        )
+        return {"users": cur.fetchall()}
+    finally:
+        cur.close()
+        conn.close()

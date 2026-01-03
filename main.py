@@ -34,6 +34,8 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(google_auth.router)
+from routers import admin
+app.include_router(admin.router)
 
 @app.get("/")
 def read_root():
